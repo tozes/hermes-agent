@@ -618,6 +618,7 @@ class TestReplyCapture:
             interim = await adapter.send(
                 "ctx-final",
                 "⏩ Steered into current run (iteration 1/200).",
+                reply_to="task-final",
                 metadata={"expect_edits": True},
             )
             assert interim.success is True
@@ -626,6 +627,7 @@ class TestReplyCapture:
             final = await adapter.send(
                 "ctx-final",
                 "FINAL_PROOF_PAYLOAD",
+                reply_to="task-final",
                 metadata={"notify": True},
             )
             assert final.success is True
@@ -636,19 +638,19 @@ class TestReplyCapture:
         finally:
             adapter._pop_pending("task-final")
 
-    def test_concurrent_same_context_tasks_resolve_fifo(self):
-        """Two in-flight tasks sharing a context must not cross-talk: replies
-        resolve the oldest outstanding task first."""
+    def test_concurrent_same_context_tasks_resolve_exactly(self):
+        """Two in-flight tasks sharing a context must not cross-talk: each final send settles
+        exactly the task it names, whatever the arrival order."""
         adapter = _bare_adapter()
         fut1 = adapter._add_pending("task-1", "ctx-shared")
         fut2 = adapter._add_pending("task-2", "ctx-shared")
 
         async def run():
-            await adapter.send("ctx-shared", "reply one", metadata={"notify": True})
-            assert fut1.done() and not fut2.done()
-            assert fut1.result(timeout=0)[1] == "reply one"
-            await adapter.send("ctx-shared", "reply two", metadata={"notify": True})
+            await adapter.send("ctx-shared", "reply two", reply_to="task-2", metadata={"notify": True})
+            assert fut2.done() and not fut1.done()
             assert fut2.result(timeout=0)[1] == "reply two"
+            await adapter.send("ctx-shared", "reply one", metadata={"notify": True, "reply_to_message_id": "task-1"})
+            assert fut1.result(timeout=0)[1] == "reply one"
 
         try:
             asyncio.run(run())
@@ -682,7 +684,7 @@ class TestReplyCapture:
         event = SimpleNamespace(message_id="task-ok")
 
         async def run():
-            await adapter.send("ctx-ok", "real reply", metadata={"notify": True})
+            await adapter.send("ctx-ok", "real reply", reply_to="task-ok", metadata={"notify": True})
             await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
         try:
@@ -886,7 +888,7 @@ def _make_live_adapter(monkeypatch, reply_fn=None):
         else:
             reply = reply_fn(event)
         if reply is not None:
-            await adapter.send(event.source.chat_id, reply, metadata={"notify": True})
+            await adapter.send(event.source.chat_id, reply, reply_to=event.message_id, metadata={"notify": True})
 
     adapter.handle_message = fake_handle_message  # type: ignore
     adapter._message_handler = object()  # non-None so dispatch proceeds

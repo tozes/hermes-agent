@@ -53,6 +53,16 @@ and push notification configs (inline or via
 memory — and the reply is returned over A2A. Completed tasks stay queryable
 via `tasks/get`.
 
+Tasks belong to the authenticated peer that created them: `tasks/get|list|
+cancel|subscribe` and push-config calls from any other peer answer "task not
+found", and a `message/send` naming a `contextId` another peer opened is
+rejected. (With a shared `A2A_BEARER_TOKEN` the peer identity is the source
+IP, so a client whose IP changes cannot see its earlier tasks — use
+`A2A_PEER_TOKENS`.) A peer's `message.metadata` (a JSON object of at most
+8 KiB, otherwise the task is rejected) reaches plugins unchanged under
+`event.metadata["a2a"]["request_metadata"]`, next to the host-owned `peer`,
+`task_id`, `context_id`, `message_id`, `agent` and `tenant` — see DESIGN.md.
+
 ## Security
 
 - **No token ⇒ localhost only.** The server binds `127.0.0.1` and refuses to

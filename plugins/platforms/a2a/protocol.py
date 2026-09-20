@@ -182,6 +182,50 @@ def extract_context_id(params: dict) -> str:
     return (str(msg.get("contextId") or "") if isinstance(msg, dict) else "") or str(params.get("contextId") or "")
 
 
+def extract_message_id(params: dict) -> str:
+    """The peer's own ``message.messageId`` ("" when absent) — informational, never a routing key."""
+    msg = params.get("message") or {}
+    return str(msg.get("messageId") or "") if isinstance(msg, dict) else ""
+
+
+# ``MessageEvent.metadata[EVENT_METADATA_KEY]`` is the host-owned A2A namespace on inbound events:
+# the authenticated peer, the exact task/context identity, and a bounded copy of the peer's own
+# ``message.metadata``. Nothing from the request body is ever placed at the top level of
+# ``event.metadata`` (so peers cannot forge ``gateway_session_*`` routing keys), and ``task_id``
+# is the exact execution association that final-output / cancel routing keys on.
+EVENT_METADATA_KEY = "a2a"
+MAX_REQUEST_METADATA_BYTES = 8192
+
+
+def extract_request_metadata(params: dict) -> Optional[dict]:
+    """Bounded copy of the peer's ``message.metadata`` (fallback: top-level ``metadata``).
+    ``{}`` when absent; ``None`` when present but not a JSON object or over the size cap — callers
+    must reject, never silently drop (a dropped delegation locator would demote a scoped task to an
+    unrestricted ordinary conversation)."""
+    msg = params.get("message")
+    raw = msg.get("metadata") if isinstance(msg, dict) and msg.get("metadata") is not None else params.get("metadata")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        return None
+    try:
+        if len(json.dumps(raw, ensure_ascii=False).encode("utf-8")) > MAX_REQUEST_METADATA_BYTES:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return json.loads(json.dumps(raw))
+
+
+def inbound_event_metadata(*, peer: str, task_id: str, context_id: str, message_id: str = "",
+                           agent_slug: str = "", tenant: str = "", request_metadata: Optional[dict] = None) -> dict:
+    """``{EVENT_METADATA_KEY: {...}}`` for an inbound MessageEvent. ``peer`` is the credential
+    identity from ``do_POST``, never a body field."""
+    return {EVENT_METADATA_KEY: {
+        "peer": peer, "task_id": task_id, "context_id": context_id, "message_id": message_id,
+        "agent": agent_slug, "tenant": tenant, "request_metadata": dict(request_metadata or {}),
+    }}
+
+
 def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "") -> dict:
     """A2A v1.0 Task. ``created_at`` is accepted but NOT serialized: the v1.0 Task proto has no
     createdAt and strict ProtoJSON parsers (a2a-sdk) reject unknown fields."""
@@ -290,8 +334,10 @@ metrics = Metrics()
 
 
 class TaskStore:
-    """In-memory A2A tasks, kept after completion for tasks/get. Records carry agent slug +
-    tenant; readers pass a scope and get not-found outside it (spec authz rule)."""
+    """In-memory A2A tasks, kept after completion for tasks/get. Records carry agent slug,
+    tenant and the authenticated peer that created them; readers pass a scope and get not-found
+    outside it (spec authz rule). An empty scope component means "unscoped" and is only for
+    in-process callers — the HTTP layer always passes the authenticated peer."""
 
     _MAX_TERMINAL = 500
 
@@ -301,17 +347,18 @@ class TaskStore:
         self._lock = threading.Lock()
 
     @staticmethod
-    def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "") -> bool:
-        return not ((agent_slug and rec.get("agent_slug", "") != agent_slug) or (tenant and rec.get("tenant", "") != tenant))
+    def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "", peer: str = "") -> bool:
+        return not ((agent_slug and rec.get("agent_slug", "") != agent_slug) or (tenant and rec.get("tenant", "") != tenant)
+                    or (peer and rec.get("peer", "") != peer))
 
-    def _scoped(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def _scoped(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
         """Live record if visible in scope. Caller holds the lock."""
         rec = self._tasks.get(task_id)
-        return rec if rec and self._in_scope(rec, agent_slug, tenant) else None
+        return rec if rec and self._in_scope(rec, agent_slug, tenant, peer) else None
 
-    def _push_rec(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def _push_rec(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
         """Scoped record that has a push config (matching ``config_id`` if given). Caller holds the lock."""
-        rec = self._scoped(task_id, agent_slug, tenant)
+        rec = self._scoped(task_id, agent_slug, tenant, peer)
         if rec and rec.get("push_url") and (not config_id or rec.get("push_config_id") == config_id):
             return rec
         return None
@@ -333,25 +380,25 @@ class TaskStore:
             if (rec := self._tasks.get(task_id)) and rec["state"] not in TERMINAL_STATES:
                 rec["state"] = state
 
-    def set_push_config(self, task_id: str, url: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def set_push_config(self, task_id: str, url: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
         """Attach a push notification config; returns the stored config or None."""
         with self._lock:
-            if not (rec := self._scoped(task_id, agent_slug, tenant)):
+            if not (rec := self._scoped(task_id, agent_slug, tenant, peer)):
                 return None
             rec["push_url"], rec["push_config_id"] = url, "cfg-" + uuid.uuid4().hex[:12]
             return self._push_config_view(rec)
 
-    def get_push_config(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def get_push_config(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
         with self._lock:
-            return self._push_config_view(rec) if (rec := self._push_rec(task_id, config_id, agent_slug, tenant)) else None
+            return self._push_config_view(rec) if (rec := self._push_rec(task_id, config_id, agent_slug, tenant, peer)) else None
 
-    def list_push_configs(self, task_id: str, agent_slug: str = "", tenant: str = "") -> list[dict]:
-        cfg = self.get_push_config(task_id, "", agent_slug, tenant)
+    def list_push_configs(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> list[dict]:
+        cfg = self.get_push_config(task_id, "", agent_slug, tenant, peer)
         return [cfg] if cfg else []
 
-    def delete_push_config(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "") -> bool:
+    def delete_push_config(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "", peer: str = "") -> bool:
         with self._lock:
-            rec = self._push_rec(task_id, config_id, agent_slug, tenant)
+            rec = self._push_rec(task_id, config_id, agent_slug, tenant, peer)
             if rec:
                 rec["push_url"] = rec["push_config_id"] = ""
             return rec is not None
@@ -363,9 +410,14 @@ class TaskStore:
                 url, rec["push_url"] = rec["push_url"], ""
             return url if rec else ""
 
-    def get(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def get(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
         with self._lock:
-            return dict(rec) if (rec := self._scoped(task_id, agent_slug, tenant)) else None
+            return dict(rec) if (rec := self._scoped(task_id, agent_slug, tenant, peer)) else None
+
+    def context_peer(self, context_id: str) -> str:
+        """Peer that owns ``context_id`` (creator of its oldest stored task), "" when unowned."""
+        with self._lock:
+            return next((rec["peer"] for rec in self._tasks.values() if rec["context_id"] == context_id), "")
 
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
         """Transition a task to a terminal state. Idempotent."""
@@ -382,9 +434,9 @@ class TaskStore:
                 fut.set_result((state, reply))
         return out
 
-    def watch(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[Future]:
+    def watch(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[Future]:
         with self._lock:
-            if not (rec := self._scoped(task_id, agent_slug, tenant)):
+            if not (rec := self._scoped(task_id, agent_slug, tenant, peer)):
                 return None
             fut: Future = Future()
             if rec["state"] in TERMINAL_STATES:
@@ -394,13 +446,13 @@ class TaskStore:
             return fut
 
     def list(self, context_id: str = "", state: str = "", page_size: int = 50, offset: int = 0,
-             agent_slug: str = "", tenant: str = "", with_total: bool = False):
+             agent_slug: str = "", tenant: str = "", with_total: bool = False, peer: str = ""):
         """Filtered task page (newest first) as ``(records, next_offset)``, or
         ``(records, next_offset, total)`` with ``with_total`` (v1.0 ListTasks totalSize)."""
         page_size = max(1, min(int(page_size or 50), 100))
         with self._lock:
             recs = [dict(r) for r in reversed(self._tasks.values())
-                    if self._in_scope(r, agent_slug, tenant)
+                    if self._in_scope(r, agent_slug, tenant, peer)
                     and (not context_id or r["context_id"] == context_id) and (not state or r["state"] == state)]
         total = len(recs)
         page = recs[offset:offset + page_size]

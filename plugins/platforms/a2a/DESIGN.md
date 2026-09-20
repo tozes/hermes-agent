@@ -52,8 +52,34 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   `contextId`, so the agent that answers is the same one serving the user —
   full memory/context, not a clone. The reply returns through `adapter.send()`,
   which fulfils the pending per-**task** `Future` the HTTP request is blocked
-  on (per-context FIFO, so concurrent same-context requests can't cross-talk);
-  `on_processing_complete` resolves failures/cancellations promptly.
+  on. The send names the exact task: the gateway's reply anchor is the inbound
+  event's `message_id` (= the A2A task id; the streaming path carries it as
+  `metadata["reply_to_message_id"]`), and it must belong to the send's context.
+  There is no per-context fallback — a final send naming no task (an
+  out-of-band notification into the context) settles nothing, and late output
+  for a canceled/settled task is dropped instead of landing on a newer task in
+  the same context. `on_processing_complete` resolves failures/cancellations
+  promptly, again by exact task id. `tasks/cancel` settles exactly that task;
+  it does not (yet) interrupt the running turn.
+- **Inbound event namespace (`event.metadata["a2a"]`):** every inbound
+  `MessageEvent` carries `{peer, task_id, context_id, message_id, agent,
+  tenant, request_metadata}` (`protocol.EVENT_METADATA_KEY`). `peer` is the
+  credential identity from `do_POST`; `request_metadata` is a bounded copy
+  (`protocol.MAX_REQUEST_METADATA_BYTES`) of the peer's `message.metadata`
+  (fallback: top-level `metadata`) — present-but-invalid metadata rejects the
+  task rather than being dropped, so a delegation locator can never silently
+  degrade into an ordinary conversation. Nothing from the body is ever placed
+  at the top level of `event.metadata`, so peers cannot forge
+  `gateway_session_*` routing keys. Plugins observe it through the existing
+  `pre_gateway_dispatch` hook. `a2a.task_id` is the exact execution
+  association that later lifecycle/policy work keys on; the gateway's own
+  runtime `task_id` (session/resource identity) is unchanged.
+- **Peer ownership:** task records carry the creating peer; `tasks/get|list|
+  cancel|subscribe` and every push-config call are scoped by (agent slug,
+  tenant, peer) — another peer's task is indistinguishable from a missing one.
+  A `contextId` belongs to the peer whose task opened it (`TaskStore.
+  context_peer`); another peer's `message/send` into it is rejected without a
+  stored record.
 - **Task store:** every task (including terminal ones, bounded to the last
   500) stays queryable via `tasks/get` / `tasks/list`, and `tasks/subscribe`
   reattaches to a running task's stream via store watchers. A watchdog fails
