@@ -26,6 +26,7 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.config import Platform
 from gateway.platforms._shared import coerce_port as _to_int, get_scoped_secret as _get_scoped_secret
+from hermes_constants import get_hermes_home
 
 from . import protocol, security
 
@@ -37,6 +38,9 @@ _DEFAULT_PORT = 9900
 _MIN_ORPHAN_TIMEOUT, _MAX_ORPHAN_TIMEOUT, _WATCHDOG_INTERVAL = 300, 86400, 60
 _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
+_CANCEL_CONFIRM_SECONDS = 5  # how long tasks/cancel waits for the interrupted turn to confirm its stop
+_PUSH_PREVIEW_CHARS = 2000  # push callbacks carry a preview; the full result is the stored Task (tasks/get)
+_INTERRUPT_REASON_CANCEL = "a2a_task_cancel"
 _DEFAULT_DESCRIPTION = "Hermes Agent — a general-purpose agent reachable over A2A."
 
 _ok = protocol.jsonrpc_result
@@ -62,8 +66,18 @@ _METHODS: dict[str, tuple[str, bool]] = {
 }
 
 
+def _task_store_path(extra: dict) -> Optional[str]:
+    """Durable task store: ``extra.task_store`` (``":memory:"`` disables persistence — tests only),
+    else ``<profile hermes home>/a2a_tasks.json``. Resolved at construction, inside profile scope."""
+    configured = str(extra.get("task_store") or "").strip()
+    if configured == ":memory:":
+        return None
+    return os.path.expanduser(configured) if configured else str(get_hermes_home() / protocol.TASK_STORE_FILENAME)
+
+
 def _reply_timeout() -> float:
-    """Seconds to wait for the agent to answer an inbound task."""
+    """Seconds a blocking message/send long-polls for the answer before returning the task as it
+    stands (WORKING). Never a cap on the work itself."""
     try:
         return max(1.0, float(os.getenv("A2A_REPLY_TIMEOUT", "300")))
     except (ValueError, TypeError):
@@ -284,18 +298,21 @@ class A2AAdapter(BasePlatformAdapter):
         self._server_thread = self._watchdog_thread = None  # type: Optional[threading.Thread]
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._watchdog_stop = threading.Event()
-        # Per-adapter protocol state (not module-global).
-        self.tasks, self._turns, self._rate_limiter = protocol.TaskStore(), protocol.TurnTracker(), protocol.RateLimiter()
+        # Per-adapter protocol state (not module-global). The task store is durable per profile.
+        self.tasks = protocol.TaskStore(_task_store_path(extra))
+        self._turns, self._rate_limiter = protocol.TurnTracker(), protocol.RateLimiter()
         # Forwarded profile sessions: (profile, agent_slug, context_id) -> session_id.
         self._profile_sessions: Dict[tuple[str, str, str], str] = {}
         self._profile_session_locks: Dict[tuple[str, str, str], threading.Lock] = {}
         self._profile_session_locks_guard = threading.Lock()
-        # Pending reply futures: task_id -> (context_id, Future). adapter.send() names the exact
-        # task through its reply anchor (the event's message_id); there is no per-context fallback.
-        self._pending: Dict[str, tuple[str, Future]] = {}
-        # Request ownership outlives reply Futures and also covers synchronous profile forwards.
+        # Tasks an HTTP request currently owns (a waiter or a synchronous profile forward); the
+        # orphan watchdog never fails these. Completion itself is event-owned (_complete_task):
+        # waiters observe TaskStore.watch futures, they do not own the execution.
         self._active_tasks: set[str] = set()
         self._pending_lock = threading.Lock()
+        # session_key -> task_id whose model turn the gateway is running right now (on_processing_*).
+        self._executing: Dict[str, str] = {}
+        self._stopping = threading.Event()
 
     @property
     def name(self) -> str:
@@ -324,6 +341,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._httpd.adapter = self  # type: ignore[attr-defined]
         self._server_thread = _daemon_thread(self._httpd.serve_forever, "a2a-http")
         self._watchdog_stop.clear()  # disconnect sets it; reset for reconnection
+        self._stopping.clear()
         self._watchdog_thread = _daemon_thread(self._watchdog_loop, "a2a-watchdog")
         self._mark_connected()
         logger.info("A2A: serving Agent Card + JSON-RPC on http://%s:%s (%s) as %r; %d routed agent(s)", self.host, self.port,
@@ -343,12 +361,12 @@ class A2AAdapter(BasePlatformAdapter):
                 self._httpd.shutdown()
                 self._httpd.server_close()
             self._httpd = None
-        # Fail any in-flight replies so blocked HTTP threads don't hang.
+        # Release blocked HTTP waiters WITHOUT failing their tasks: in-flight work stays WORKING in
+        # the durable store and is recovered after the restart (see handle_message).
+        self._stopping.set()
         with self._pending_lock:
-            for tid in list(self._pending):
-                self._resolve_locked(tid, protocol.STATE_FAILED, "[agent shutting down]")
-            self._pending.clear()
             self._active_tasks.clear()
+            self._executing.clear()
 
     def _watchdog_loop(self) -> None:
         """Background thread that fails orphaned tasks (keeps them queryable)."""
@@ -359,14 +377,18 @@ class A2AAdapter(BasePlatformAdapter):
                 logger.debug("A2A: watchdog error", exc_info=True)
 
     def _fail_orphans_once(self) -> list[str]:
-        """Fail stale tasks that no request still owns."""
+        """Inactivity control (not a wall-clock cap): fail an idle task only when no request owns
+        it AND its execution is not alive in the gateway."""
         with self._pending_lock:
-            active_tasks = set(self._active_tasks)
+            keep = set(self._active_tasks)
+        keep |= {r["task_id"] for r in self.tasks.in_flight() if self._execution_alive(r)}
         timeout = _orphan_timeout()
-        failed = self.tasks.fail_orphans(timeout, exclude=active_tasks)
+        failed = self.tasks.fail_orphans(timeout, exclude=keep)
         for tid in failed:
-            logger.warning("A2A: orphaned task %s marked failed (timeout %gs)", tid, timeout)
+            logger.warning("A2A: orphaned task %s marked failed (idle > %gs, execution not alive)", tid, timeout)
             protocol.metrics.tasks_failed += 1
+            if rec := self.tasks.get(tid):
+                self._lifecycle("closed", rec)
         return failed
 
     def _load_served_agents(self, extra: dict) -> dict[str, dict]:
@@ -476,33 +498,49 @@ class A2AAdapter(BasePlatformAdapter):
             logger.debug("A2A: tool registry unavailable for Agent Card", exc_info=True)
         return protocol.skills_from_toolsets(configured or [])
 
-    def _add_pending(self, task_id: str, context_id: str) -> Future:
-        fut: Future = Future()
-        with self._pending_lock:
-            self._active_tasks.add(task_id)
-            self._pending[task_id] = (context_id, fut)
-        return fut
-
     def _activate_task(self, task_id: str) -> None:
         with self._pending_lock:
             self._active_tasks.add(task_id)
 
-    def _pop_pending(self, task_id: str) -> None:
+    def _release_task(self, task_id: str) -> None:
+        """The HTTP request no longer owns the task; the task itself keeps running."""
         with self._pending_lock:
             self._active_tasks.discard(task_id)
-            self._pending.pop(task_id, None)
 
-    def _resolve_locked(self, task_id: str, state: str, text: str, context_id: Optional[str] = None) -> bool:
-        entry = self._pending.get(task_id)
-        if not entry or entry[1].done() or (context_id is not None and entry[0] != context_id):
-            return False
-        entry[1].set_result((state, text))
-        return True
-
-    def _resolve_task(self, task_id: str, state: str, text: str, context_id: Optional[str] = None) -> bool:
-        """Settle exactly ``task_id`` (and only if it belongs to ``context_id`` when given)."""
+    def _execution_alive(self, rec: dict) -> bool:
+        """Is the gateway running (or resuming) this task's turn?"""
         with self._pending_lock:
-            return self._resolve_locked(task_id, state, text, context_id)
+            if rec["task_id"] in self._executing.values():
+                return True
+        session_key = rec.get("session_key") or ""
+        running = getattr(self.gateway_runner, "_is_session_running", None)
+        return bool(session_key and callable(running) and running(session_key))
+
+    def _lifecycle(self, phase: str, rec: dict) -> Optional[str]:
+        """Fire ``protocol.LIFECYCLE_HOOK``. For ``recover`` returns the denial reason when any
+        callback denies or raises (fail closed); other phases are observers and return None."""
+        try:
+            from hermes_cli.plugins import iter_hook_callbacks
+            callbacks = iter_hook_callbacks(protocol.LIFECYCLE_HOOK)
+        except Exception:
+            logger.debug("A2A: lifecycle hook discovery failed", exc_info=True)
+            callbacks = ()
+        view = protocol.TaskStore.lifecycle_view(rec)
+        for cb in callbacks:
+            try:
+                result = cb(phase=phase, task=dict(view))
+            except Exception as e:  # plugin boundary: recover fails closed, observers log and continue
+                logger.warning("A2A: %s(%s) hook failed for task %s", protocol.LIFECYCLE_HOOK, phase, rec["task_id"], exc_info=True)
+                if phase == "recover":
+                    return f"{getattr(cb, '__name__', 'hook')} raised: {e}"
+                continue
+            if phase == "recover" and isinstance(result, dict) and result.get("action") == "deny":
+                return str(result.get("reason") or "recovery denied by plugin")
+        return None
+
+    def _source_for_record(self, rec: dict):
+        peer = rec["peer"]
+        return self.build_source(chat_id=rec["context_id"], chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer)
 
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
         return tuple(str((agent or self._agents[""]).get(k) or "") for k in ("slug", "tenant"))
@@ -536,7 +574,10 @@ class A2AAdapter(BasePlatformAdapter):
                                        f"Context {context_id} belongs to another peer."), None
         turn = self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns()
-        rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
+        try:
+            rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
+        except protocol.TaskStoreUnavailable as e:  # fail closed and say why; never pretend the store is empty
+            return protocol.build_task(task_id, context_id, protocol.STATE_FAILED, f"Task store unavailable: {e}"), None
         if turn > max_turns:
             protocol.metrics.anti_loop_triggers += 1
             logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)", context_id, turn, max_turns)
@@ -557,19 +598,24 @@ class A2AAdapter(BasePlatformAdapter):
             self._activate_task(task_id)
             try:
                 reply, state = self._forward_to_profile(agent, peer, context_id, framed)
-                self._record_outcome(task_id, context_id, peer, state, reply)
-                return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
+                self._complete_task(task_id, state, reply)
+                return protocol.TaskStore.to_task(self.tasks.get(task_id) or rec), None
             finally:
-                self._pop_pending(task_id)
+                self._release_task(task_id)
         if self._loop is None or self._message_handler is None:
             return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.")
-        fut = self._add_pending(task_id, context_id)
         agent_slug, tenant = self._scope_for_agent(agent)
+        message_id = protocol.extract_message_id(params)
         event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
                              source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer),
                              metadata=protocol.inbound_event_metadata(
-                                 peer=peer, task_id=task_id, context_id=context_id, message_id=protocol.extract_message_id(params),
+                                 peer=peer, task_id=task_id, context_id=context_id, message_id=message_id,
                                  agent_slug=agent_slug, tenant=tenant, request_metadata=request_metadata))
+        # Durable session linkage BEFORE dispatch: a crash right after this still recovers the task.
+        self.tasks.set_dispatch(task_id, session_key=self._event_session_key(event),
+                                request_metadata=request_metadata, message_id=message_id)
+        self._activate_task(task_id)
+        fut = self.tasks.watch(task_id)
         try:
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
         except Exception as e:
@@ -577,7 +623,7 @@ class A2AAdapter(BasePlatformAdapter):
             try:
                 return self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
             finally:
-                self._pop_pending(task_id)
+                self._release_task(task_id)
         self.tasks.set_state(task_id, protocol.STATE_WORKING)
         return None, {"task_id": task_id, "context_id": context_id, "peer": peer, "future": fut, "created_iso": rec["created_iso"], "started": time.time()}
 
@@ -619,62 +665,78 @@ class A2AAdapter(BasePlatformAdapter):
                           "A2A: could not title forwarded session", commit=True)
             return security.redact_outbound((proc.stdout or "").strip()), protocol.STATE_COMPLETED
 
-    def _record_outcome(self, task_id: str, context_id: str, peer: str, state: str, reply: str,
-                        started: Optional[float] = None) -> None:
-        """Persist + audit + count a finished task, mark it terminal, and fire its push callback."""
-        protocol.persist_message(context_id, "agent", reply, task_id)
-        security.audit("outbound", peer, task_id, reply)
+    def _complete_task(self, task_id: str, state: str, reply: str, context_id: Optional[str] = None) -> bool:
+        """The single terminal transition for a dispatched task, whoever observed its end (a final
+        send, the processing-complete hook, a cancel): redact, detect the [INPUT_REQUIRED] marker,
+        store the FULL reply, persist/audit/count, push, fire the ``closed`` lifecycle phase.
+        Idempotent; False when the task is unknown, already terminal, or not in ``context_id``.
+        Blocking (push callback): call it off the event loop."""
+        rec = self.tasks.get(task_id)
+        if not rec or (context_id is not None and rec["context_id"] != context_id):
+            return False
+        reply = security.redact_outbound(reply or "")
+        stripped = reply.lstrip()
+        if state == protocol.STATE_COMPLETED and stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
+            state, reply = protocol.STATE_INPUT_REQUIRED, stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
+        done = self.tasks.complete(task_id, state, reply)
+        if done is None:
+            return False
+        with self._pending_lock:
+            if self._executing.get(done.get("session_key") or "") == task_id:
+                self._executing.pop(done["session_key"], None)
+        protocol.persist_message(done["context_id"], "agent", reply, task_id)
+        security.audit("outbound", done["peer"], task_id, reply)
         m = protocol.metrics
         if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
             m.outbound_total, m.tasks_completed = m.outbound_total + 1, m.tasks_completed + 1
-            if started is not None:
-                m.record_latency(time.time() - started)
+            m.record_latency(time.time() - done["created_at"])
         else:
             m.tasks_failed += 1
-        self.tasks.complete(task_id, state, reply)
-        self._send_push_notification(task_id, context_id, reply, state)
+        self._send_push_notification(task_id, done["context_id"], reply, state)
+        self._lifecycle("closed", done)
+        return True
 
-    def _finalize_task(self, pending: dict, state: str, reply: str) -> tuple[str, str]:
-        """Record a dispatched task's outcome; returns (state, reply) after redaction and
-        input-required detection (a leading marker flags a clarification request)."""
-        task_id, context_id, peer = pending["task_id"], pending["context_id"], pending["peer"]
-        try:
-            reply = security.redact_outbound(reply or "")
-            stripped = reply.lstrip()
-            if state == protocol.STATE_COMPLETED and stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
-                state, reply = protocol.STATE_INPUT_REQUIRED, stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
-            self._record_outcome(task_id, context_id, peer, state, reply, started=pending["started"])
-            return state, reply
-        finally:
-            self._pop_pending(task_id)
-
-    @staticmethod
-    def _await_future(fut: Future, deadline: float, keepalive, on_timeout: tuple[str, str]) -> tuple[str, str]:
-        """Block until ``fut`` resolves or ``deadline`` passes (-> ``on_timeout``). ``keepalive`` runs
-        every _SSE_KEEPALIVE seconds while waiting; if it raises, the client is gone and we stop."""
+    def _await_future(self, fut: Future, deadline: Optional[float], keepalive, on_timeout):
+        """Block until ``fut`` resolves (-> ``(state, reply)``), ``deadline`` passes, the client
+        goes away (``keepalive`` raises) or the adapter stops (-> ``on_timeout``). ``deadline=None``
+        waits for the terminal state: the work has no wall-clock cap."""
         while True:
             try:
-                return fut.result(timeout=_SSE_KEEPALIVE if keepalive else max(0.0, deadline - time.time()))
+                wait = _SSE_KEEPALIVE if deadline is None else max(0.0, min(_SSE_KEEPALIVE, deadline - time.time()))
+                return fut.result(timeout=wait)
             except FuturesTimeout:
-                if time.time() >= deadline:
+                if self._stopping.is_set() or (deadline is not None and time.time() >= deadline):
                     return on_timeout
                 if keepalive:
                     try:
                         keepalive()
                     except Exception:
-                        return (protocol.STATE_FAILED, "[client disconnected]")
+                        return on_timeout
             except Exception:
                 return on_timeout
 
-    def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str]:
-        return self._await_future(pending["future"], pending["started"] + _reply_timeout(), keepalive,
-                                  (protocol.STATE_FAILED, "[agent did not reply in time]"))
+    def _await_reply(self, pending: dict, keepalive=None, *, bounded: bool = True):
+        """Observe a dispatched task's outcome: ``(state, reply)`` or None when the bounded wait
+        (A2A_REPLY_TIMEOUT for message/send) elapsed — the task keeps running either way."""
+        deadline = pending["started"] + _reply_timeout() if bounded else None
+        return self._await_future(pending["future"], deadline, keepalive, None)
+
+    def _current_task(self, pending: dict) -> dict:
+        rec = self.tasks.get(pending["task_id"])
+        return protocol.TaskStore.to_task(rec) if rec else protocol.build_task(
+            pending["task_id"], pending["context_id"], protocol.STATE_WORKING, created_at=pending["created_iso"])
 
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
+        """Blocking by default (bounded long-poll, then the task as it stands); v1.0
+        ``configuration.returnImmediately`` answers with the WORKING task at once."""
         task, pending = self._prepare_task(params, peer, agent=agent)
         if task is None:
-            state, reply = self._finalize_task(pending, *self._await_reply(pending))
-            task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
+            try:
+                if not protocol.extract_return_immediately(params):
+                    self._await_reply(pending)
+            finally:
+                self._release_task(pending["task_id"])
+            task = self._current_task(pending)
         return _ok(req_id, protocol.send_message_response(task) if v1_response else task)
 
     @staticmethod
@@ -718,13 +780,15 @@ class A2AAdapter(BasePlatformAdapter):
             submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])
             self._sse_write(handler, protocol.sse_data(protocol.stream_task(submitted), req_id))
             self._sse_write(handler, protocol.sse_data(protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
-            state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
-            pending = None
-            self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
+            # Streams follow the task to its terminal state (no wall-clock cap); only an adapter stop
+            # closes one early, on the task's current (non-terminal) state.
+            outcome = self._await_reply(pending, keepalive=self._keepalive(handler), bounded=False) or (protocol.STATE_WORKING, "")
+            self._emit_terminal(handler, task_id, context_id, *outcome, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
+            logger.debug("A2A: stream client disconnected; its task keeps running")
+        finally:
             if pending is not None:
-                self._finalize_task(pending, protocol.STATE_FAILED, "[client disconnected]")
-            logger.debug("A2A: stream client disconnected")
+                self._release_task(pending["task_id"])
 
     def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None, peer: str = "") -> None:
         """Reconnect to an existing task's stream (v1.0 SubscribeToTask)."""
@@ -735,8 +799,7 @@ class A2AAdapter(BasePlatformAdapter):
         try:
             if (fut := self.tasks.watch(task_id, *self._scope(agent, peer))) is None:
                 return self._sse_write(handler, protocol.sse_done())
-            state, reply = self._await_future(fut, time.time() + _reply_timeout(), self._keepalive(handler),
-                                              (rec["state"], rec.get("reply", "")))
+            state, reply = self._await_future(fut, None, self._keepalive(handler), None) or (rec["state"], rec.get("reply", ""))
             self._emit_terminal(handler, task_id, rec["context_id"], state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: subscribe client disconnected")
@@ -765,18 +828,63 @@ class A2AAdapter(BasePlatformAdapter):
                             "pageSize": max(1, min(page_size, 100)), "totalSize": total})
 
     def _rpc_tasks_cancel(self, req_id: Any, params: dict, agent: Optional[dict] = None, peer: str = "") -> dict:
-        """Cancel exactly this peer's task: its waiter settles CANCELED and any late output for
-        it is dropped. The running turn itself is not interrupted here."""
+        """Cancel exactly this peer's task. The request is recorded durably and announced
+        (``cancel_requested`` lifecycle phase) first; if the task's own execution is running, the
+        gateway's /stop path interrupts that session (and its background delegations) and we wait
+        briefly for the confirmed stop. An unconfirmed stop answers WORKING + metadata.cancelRequested,
+        never a claimed CANCELED; a task that is not executing is canceled outright."""
         task_id, rec, error = self._find_task(req_id, params, agent, peer)
         if error:
             return error
         if rec["state"] in protocol.TERMINAL_STATES:
             return _err(req_id, protocol.ERR_TASK_NOT_CANCELABLE, f"task {task_id} already {rec['state']}")
-        self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
+        rec = self.tasks.request_cancel(task_id) or rec
         self._turns.reset(rec["context_id"])
-        self._resolve_task(task_id, protocol.STATE_CANCELED, "")
+        self._lifecycle("cancel_requested", rec)
+        if self._execution_alive(rec) and self._loop is not None:
+            confirmed = self.tasks.watch(task_id)
+            asyncio.run_coroutine_threadsafe(self._cancel_execution(rec), self._loop)
+            self._await_future(confirmed, time.time() + _CANCEL_CONFIRM_SECONDS, None, None)
+        else:
+            self._drop_queued_event(rec)
+            self._complete_task(task_id, protocol.STATE_CANCELED, "")
         rec = self.tasks.get(task_id, *self._scope(agent, peer)) or rec
         return _ok(req_id, protocol.TaskStore.to_task(rec))
+
+    def _drop_queued_event(self, rec: dict) -> None:
+        """A canceled task still queued behind a busy session must not run later."""
+        session_key = rec.get("session_key") or ""
+        queued = self._pending_messages.get(session_key)
+        if queued is not None and getattr(queued, "message_id", None) == rec["task_id"]:
+            self._pending_messages.pop(session_key, None)
+
+    async def _cancel_execution(self, rec: dict) -> None:
+        """Mirror of the /stop bypass for exactly this task's session: interrupt the running turn
+        (the runner also interrupts its background delegations), cancel the processing task —
+        which confirms the stop through on_processing_complete(CANCELLED) — then drain follow-ups."""
+        session_key = rec.get("session_key") or ""
+        with self._pending_lock:
+            owns = self._executing.get(session_key) == rec["task_id"]
+        if not session_key or not owns:
+            return
+        command_guard = asyncio.Event()
+        current_guard = self._active_sessions.get(session_key)
+        self._active_sessions[session_key] = command_guard
+        try:
+            interrupt = getattr(self.gateway_runner, "_interrupt_and_clear_session", None)
+            if callable(interrupt):
+                await interrupt(session_key, self._source_for_record(rec),
+                                interrupt_reason=_INTERRUPT_REASON_CANCEL, invalidation_reason=_INTERRUPT_REASON_CANCEL)
+            await self.cancel_session_processing(session_key, release_guard=False, discard_pending=False)
+        except Exception:
+            logger.warning("A2A: cancel of task %s could not interrupt session %s", rec["task_id"], session_key, exc_info=True)
+            if self._active_sessions.get(session_key) is command_guard:
+                if session_key in self._session_tasks and current_guard is not None:
+                    self._active_sessions[session_key] = current_guard
+                else:
+                    self._release_session_guard(session_key, guard=command_guard)
+            return
+        await self._drain_pending_after_session_command(session_key, command_guard)
 
     def _register_inline_push(self, task_id: str, params: dict, agent: Optional[dict] = None, peer: str = "") -> None:
         """v1.0: message/send can carry configuration.taskPushNotificationConfig."""
@@ -823,7 +931,8 @@ class A2AAdapter(BasePlatformAdapter):
             return
         if not security.is_safe_callback_url(callback_url, localhost_mode=self._security_context.localhost_only()):
             return fail("blocked — unsafe callback URL: %s", callback_url)
-        payload = protocol.status_update(task_id, context_id, state, (reply or "")[:2000])
+        # A push carries a PREVIEW; the authoritative full result is the stored Task (tasks/get).
+        payload = protocol.status_update(task_id, context_id, state, (reply or "")[:_PUSH_PREVIEW_CHARS])
         headers = {"Content-Type": "application/json"}
         if signature := self._security_context.sign_push_payload(payload):
             headers["X-A2A-Signature"] = signature
@@ -851,9 +960,9 @@ class A2AAdapter(BasePlatformAdapter):
         if not meta.get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
         elif not task_id:
-            logger.debug("A2A: final send for context %s names no task; not settling any waiter", chat_id)
-        elif not self._resolve_task(task_id, protocol.STATE_COMPLETED, content or "", context_id=chat_id):
-            logger.debug("A2A: send() for task %s (context %s) had no pending waiter", task_id, chat_id)  # late / canceled
+            logger.debug("A2A: final send for context %s names no task; not settling any task", chat_id)
+        elif not await asyncio.to_thread(self._complete_task, task_id, protocol.STATE_COMPLETED, content or "", chat_id):
+            logger.debug("A2A: final send for task %s (context %s) found no open task", task_id, chat_id)  # late / canceled
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -862,10 +971,67 @@ class A2AAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": f"a2a:{chat_id}", "type": "dm"}
 
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Inbound tasks flow through the base pipeline unchanged. The gateway's restart resume
+        (an internal, empty-text event with no message_id) is re-attached to the task whose
+        execution the crash interrupted — after the ``recover`` lifecycle phase authorized it."""
+        if getattr(event, "internal", False) and not (event.text or "") and not getattr(event, "message_id", None) \
+                and event.source is not None and not await asyncio.to_thread(self._attach_recovery, event):
+            return  # denied or canceled: nothing resumes (the caller releases its pre-claimed slot)
+        await super().handle_message(event)
+
+    def _attach_recovery(self, event: MessageEvent) -> bool:
+        """Bind a resume event to the interrupted task of its session (bumping the local execution
+        epoch), fail the queued tasks that died with the process, and refuse when the ``recover``
+        phase denies or the task was canceled meanwhile. True = let the event run."""
+        session_key = self._event_session_key(event)
+        with self._pending_lock:
+            if session_key in self._executing:
+                return True  # a live turn: this is an ordinary internal wake, not a recovery
+        records = self.tasks.in_flight(session_key)
+        started = [r for r in records if r.get("execution_started_at")]
+        target = max(started, key=lambda r: r["execution_started_at"]) if started else None
+        for rec in records:
+            if rec is not target:
+                self._complete_task(rec["task_id"], protocol.STATE_FAILED, "[task lost on gateway restart]")
+        if target is None:
+            return True
+        if target.get("cancel_requested_at"):
+            self._complete_task(target["task_id"], protocol.STATE_CANCELED, "")
+            return False
+        if denial := self._lifecycle("recover", target):
+            logger.warning("A2A: recovery of task %s denied: %s", target["task_id"], denial)
+            self._complete_task(target["task_id"], protocol.STATE_FAILED, f"[recovery denied: {denial}]")
+            self._clear_resume_pending(session_key)
+            return False
+        epoch = self.tasks.begin_recovery(target["task_id"])
+        event.message_id = target["task_id"]
+        event.metadata.update(protocol.inbound_event_metadata(
+            peer=target["peer"], task_id=target["task_id"], context_id=target["context_id"], message_id=target.get("message_id", ""),
+            agent_slug=target.get("agent_slug", ""), tenant=target.get("tenant", ""), request_metadata=target.get("request_metadata"),
+            execution_epoch=epoch, recovery={"epoch": epoch, "reason": "restart"}))
+        logger.info("A2A: resuming task %s (execution epoch %d)", target["task_id"], epoch)
+        return True
+
+    def _clear_resume_pending(self, session_key: str) -> None:
+        clear = getattr(getattr(self.gateway_runner, "session_store", None), "clear_resume_pending", None)
+        if callable(clear):
+            with contextlib.suppress(Exception):
+                clear(session_key)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """The gateway began (or resumed) this task's turn: remember which task owns the session's
+        execution and stamp it durably (the restart recovery keys on it)."""
+        task_id = str(getattr(event, "message_id", "") or "")
+        if task_id and self.tasks.get(task_id):
+            with self._pending_lock:
+                self._executing[self._event_session_key(event)] = task_id
+            await asyncio.to_thread(self.tasks.mark_execution_started, task_id)
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Resolve the task future when processing ends without a reply send (failures,
-        cancellations, empty runs, or a reply the gateway already streamed to the user) so the
-        HTTP thread returns promptly."""
+        """Settle the exact task when its turn ends without a final send (failures, confirmed
+        cancellations, empty runs, or a reply the gateway already streamed to the user); a task
+        already completed by its final send is untouched."""
         task_id = str(getattr(event, "message_id", "") or "")
         if task_id:
             # A streamed turn never calls send() with notify=True (the gateway suppresses the
@@ -875,7 +1041,8 @@ class A2AAdapter(BasePlatformAdapter):
             # reads for /goal and /loop.
             _streamed = getattr(event, "_streamed_final_response", "")
             default = (protocol.STATE_COMPLETED, _streamed if isinstance(_streamed, str) else "")
-            self._resolve_task(task_id, *{
+            state, text = {
                 ProcessingOutcome.FAILURE: (protocol.STATE_FAILED, "[agent processing failed]"),
                 ProcessingOutcome.CANCELLED: (protocol.STATE_CANCELED, ""),
-            }.get(outcome, default))
+            }.get(outcome, default)
+            await asyncio.to_thread(self._complete_task, task_id, state, text)

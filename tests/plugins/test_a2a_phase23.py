@@ -42,7 +42,7 @@ def _make_live_adapter(monkeypatch, reply_fn=None):
 
     port = _free_port()
     monkeypatch.setenv("A2A_PORT", str(port))
-    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"task_store": ":memory:"}))
 
     async def fake_handle_message(event):
         reply = "ECHO: " + event.text if reply_fn is None else reply_fn(event)
@@ -455,7 +455,7 @@ class TestTaskStore:
         store = protocol.TaskStore()
         store.create("t-old", "c1", "p")
         store.create("t-new", "c1", "p")
-        store._tasks["t-old"]["created_at"] = time.time() - 600
+        store._tasks["t-old"]["updated_at"] = time.time() - 600
         failed = store.fail_orphans(timeout_seconds=300)
         assert failed == ["t-old"]
         assert store.get("t-old")["state"] == protocol.STATE_FAILED
@@ -470,16 +470,16 @@ class TestTaskStore:
         for task_id, age in (("t-live", 700), ("t-orphan", 700), ("t-within-reply-window", 400)):
             adapter.tasks.create(task_id, "c1", "p")
             adapter.tasks.set_state(task_id, protocol.STATE_WORKING)
-            adapter.tasks._tasks[task_id]["created_at"] = now - age
+            adapter.tasks._tasks[task_id]["updated_at"] = now - age
 
-        adapter._add_pending("t-live", "c1")
+        adapter._activate_task("t-live")
         agent = {"slug": "dev", "tenant": "dev", "profile": "dev", "local": False, "timeout": 900}
 
         def fake_forward(*_args):
             forwarded_id = next(tid for tid in adapter.tasks._tasks if tid not in {
                 "t-live", "t-orphan", "t-within-reply-window"
             })
-            adapter.tasks._tasks[forwarded_id]["created_at"] = now - 700
+            adapter.tasks._tasks[forwarded_id]["updated_at"] = now - 700
             assert adapter._fail_orphans_once() == ["t-orphan"]
             return "forwarded reply", protocol.STATE_COMPLETED
 
@@ -494,64 +494,41 @@ class TestTaskStore:
         assert adapter.tasks.get("t-live")["state"] == protocol.STATE_WORKING
         assert adapter.tasks.get("t-within-reply-window")["state"] == protocol.STATE_WORKING
 
-        adapter._pop_pending("t-live")
+        adapter._release_task("t-live")
         assert adapter._fail_orphans_once() == ["t-live"]
 
-    def test_orphan_timeout_is_bounded_and_disconnect_clears_active_tasks(self, monkeypatch):
+    def test_orphan_timeout_is_bounded_and_disconnect_keeps_tasks_working(self, monkeypatch):
+        """Disconnect releases waiters but never fails in-flight work: it is recoverable."""
         from plugins.platforms.a2a import adapter as mod
         monkeypatch.setenv("A2A_REPLY_TIMEOUT", "1e18")
         assert mod._orphan_timeout() == mod._MAX_ORPHAN_TIMEOUT
 
         adapter, _base = _make_live_adapter(monkeypatch)
-        adapter._add_pending("t-live", "c1")
+        adapter.tasks.create("t-live", "c1", "peer")
+        adapter.tasks.set_state("t-live", protocol.STATE_WORKING)
+        adapter._activate_task("t-live")
         asyncio.run(adapter.disconnect())
         assert adapter._active_tasks == set()
+        assert adapter.tasks.get("t-live")["state"] == protocol.STATE_WORKING
 
-    def test_watchdog_cannot_race_local_finalization(self, monkeypatch):
+    def test_completion_is_idempotent_against_the_watchdog(self, monkeypatch):
         adapter, _base = _make_live_adapter(monkeypatch)
-        rec = adapter.tasks.create("t-live", "c1", "peer")
+        adapter.tasks.create("t-live", "c1", "peer")
         adapter.tasks.set_state("t-live", protocol.STATE_WORKING)
-        adapter.tasks._tasks["t-live"]["created_at"] = time.time() - 700
-        future = adapter._add_pending("t-live", "c1")
-        future.set_result((protocol.STATE_COMPLETED, "reply"))
-        pending = {
-            "task_id": "t-live", "context_id": "c1", "peer": "peer",
-            "future": future, "created_iso": rec["created_iso"], "started": time.time(),
-        }
-
-        original_redact = security.redact_outbound
-        finalizing = threading.Event()
-        resume = threading.Event()
-        result = []
-
-        def pause_while_finalizing(reply):
-            finalizing.set()
-            assert resume.wait(timeout=1)
-            return original_redact(reply)
-
-        monkeypatch.setattr(security, "redact_outbound", pause_while_finalizing)
-        thread = threading.Thread(
-            target=lambda: result.append(adapter._finalize_task(pending, *adapter._await_reply(pending)))
-        )
-        thread.start()
-        assert finalizing.wait(timeout=1)
-        try:
-            assert adapter._fail_orphans_once() == []
-        finally:
-            resume.set()
-            thread.join(timeout=1)
-
-        assert not thread.is_alive()
-        assert result == [(protocol.STATE_COMPLETED, "reply")]
+        adapter.tasks._tasks["t-live"]["updated_at"] = time.time() - 700
+        assert adapter._complete_task("t-live", protocol.STATE_COMPLETED, "reply") is True
+        assert adapter._fail_orphans_once() == []
+        assert adapter._complete_task("t-live", protocol.STATE_FAILED, "late") is False
         assert adapter.tasks.get("t-live")["state"] == protocol.STATE_COMPLETED
 
-    def test_stream_disconnect_releases_active_request(self, monkeypatch):
+    def test_stream_disconnect_keeps_task_running(self, monkeypatch):
         adapter, _base = _make_live_adapter(monkeypatch)
         rec = adapter.tasks.create("t-live", "c1", "peer")
         adapter.tasks.set_state("t-live", protocol.STATE_WORKING)
+        adapter._activate_task("t-live")
         pending = {
             "task_id": "t-live", "context_id": "c1", "peer": "peer",
-            "future": adapter._add_pending("t-live", "c1"),
+            "future": adapter.tasks.watch("t-live"),
             "created_iso": rec["created_iso"], "started": time.time(),
         }
         monkeypatch.setattr(adapter, "_prepare_task", lambda *_args, **_kwargs: (None, pending))
@@ -575,10 +552,11 @@ class TestTaskStore:
         adapter._rpc_message_stream(Handler(), 1, {}, "peer")
 
         stored = adapter.tasks.get("t-live")
-        assert stored["state"] == protocol.STATE_FAILED
-        assert stored["reply"] == "[client disconnected]"
-        assert "t-live" not in adapter._pending
+        assert stored["state"] == protocol.STATE_WORKING  # the request left; the work did not
         assert "t-live" not in adapter._active_tasks
+        # Its result still lands when the turn finishes.
+        asyncio.run(adapter.send("c1", "late but real", reply_to="t-live", metadata={"notify": True}))
+        assert adapter.tasks.get("t-live")["reply"] == "late but real"
 
     def test_list_newest_first_with_filters(self):
         store = protocol.TaskStore()
@@ -619,7 +597,7 @@ class TestDynamicAgentCards:
         monkeypatch.setattr(registry, "get_tool_names_for_toolset",
                             lambda ts: {"webz": ["web_search"], "termz": ["terminal"]}[ts])
 
-        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"task_store": ":memory:"}))
         card = adapter._build_card()
         by_name = {s["name"]: s for s in card["skills"]}
         assert set(by_name) == {"webz", "termz"}
@@ -635,7 +613,7 @@ class TestDynamicAgentCards:
         monkeypatch.setattr(registry, "get_tool_names_for_toolset", lambda ts: [])
         monkeypatch.setenv("A2A_ADVERTISED_TOOLSETS", "webz")
 
-        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"task_store": ":memory:"}))
         card = adapter._build_card()
         assert [s["name"] for s in card["skills"]] == ["webz"]
 

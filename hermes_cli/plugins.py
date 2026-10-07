@@ -140,7 +140,7 @@ VALID_HOOKS: Set[str] = {
     # agent_loop_stopped: an agent turn was interrupted mid-run (/stop, or the running-agent
     # fast-path of /new; see gateway/run.py::_interrupt_and_clear_session). Kwargs: session_key,
     # platform, reason, invalidation_reason. Return values are ignored.
-    "agent_loop_stopped",
+    "agent_loop_stopped", "a2a_task_lifecycle",  # a2a_task_lifecycle contract: plugins/platforms/a2a/protocol.py
     # Approval observers (returns ignored; veto via pre_tool_call). Kwargs: command, description, pattern_key,
     # pattern_keys, session_key, surface ("cli"|"gateway"|"smart"|"mcp-elicitation/<server>"|"mcp-trust/<server>"|
     # "vault-payment"); post_approval_response adds choice/decided_by. on_human_input_*: tools/human_input_hooks.py.

@@ -5,7 +5,9 @@ Stdlib only. ``extract_text`` stays tolerant of v0.3 peers."""
 
 from __future__ import annotations
 
+import copy
 import json
+import logging
 import os
 import threading
 import time
@@ -18,6 +20,8 @@ from typing import Any, Optional
 
 from gateway.platforms._shared import coerce_port as _coerce_int
 from hermes_constants import get_hermes_home
+
+_log = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "1.0"
 
@@ -217,13 +221,35 @@ def extract_request_metadata(params: dict) -> Optional[dict]:
 
 
 def inbound_event_metadata(*, peer: str, task_id: str, context_id: str, message_id: str = "",
-                           agent_slug: str = "", tenant: str = "", request_metadata: Optional[dict] = None) -> dict:
+                           agent_slug: str = "", tenant: str = "", request_metadata: Optional[dict] = None,
+                           execution_epoch: int = 1, recovery: Optional[dict] = None) -> dict:
     """``{EVENT_METADATA_KEY: {...}}`` for an inbound MessageEvent. ``peer`` is the credential
-    identity from ``do_POST``, never a body field."""
+    identity from ``do_POST``, never a body field. ``execution_epoch`` is the local recovery
+    counter; ``recovery`` (``{"epoch", "reason"}``) is present only on a resumed execution."""
     return {EVENT_METADATA_KEY: {
         "peer": peer, "task_id": task_id, "context_id": context_id, "message_id": message_id,
         "agent": agent_slug, "tenant": tenant, "request_metadata": dict(request_metadata or {}),
+        "execution_epoch": int(execution_epoch), **({"recovery": dict(recovery)} if recovery else {}),
     }}
+
+
+def extract_return_immediately(params: dict) -> bool:
+    """v1.0 ``configuration.returnImmediately`` (legacy v0.3 ``blocking: false``)."""
+    cfg = params.get("configuration") or {}
+    if not isinstance(cfg, dict):
+        return False
+    if cfg.get("returnImmediately") is not None:
+        return bool(cfg.get("returnImmediately"))
+    return cfg.get("blocking") is False
+
+
+# Plugin lifecycle hook for A2A tasks (registered in ``hermes_cli.plugins.VALID_HOOKS``). Kwargs:
+# ``phase`` and ``task`` (``TaskStore.lifecycle_view``). Phases: ``recover`` — before any resumed
+# model work; a callback returning ``{"action": "deny", "reason": ...}`` or raising DENIES the
+# recovery (the task fails, nothing runs). ``cancel_requested`` / ``closed`` are observers (the
+# authority-close and fence points for an integration that bound credentials to the execution).
+LIFECYCLE_HOOK = "a2a_task_lifecycle"
+TASK_STORE_FILENAME = "a2a_tasks.json"
 
 
 def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "") -> dict:
@@ -333,18 +359,96 @@ class Metrics:
 metrics = Metrics()
 
 
+class TaskStoreUnavailable(RuntimeError):
+    """The durable task store could not be read; callers must fail closed, never start empty."""
+
+
 class TaskStore:
-    """In-memory A2A tasks, kept after completion for tasks/get. Records carry agent slug,
-    tenant and the authenticated peer that created them; readers pass a scope and get not-found
-    outside it (spec authz rule). An empty scope component means "unscoped" and is only for
-    in-process callers — the HTTP layer always passes the authenticated peer."""
+    """A2A tasks, kept after completion for tasks/get. With ``path`` every mutation is persisted
+    atomically as ``{"version": 1, "tasks": [...]}`` so a task, its FULL output and its execution
+    linkage (session key, local execution epoch, cancel request) survive a gateway restart.
+    Records carry agent slug, tenant and the authenticated peer that created them; readers pass a
+    scope and get not-found outside it (spec authz rule). An empty scope component means "unscoped"
+    and is only for in-process callers — the HTTP layer always passes the authenticated peer.
 
+    Unreadable, corrupt or newer-version state sets ``unavailable`` (a diagnostic reason):
+    ``create`` raises :class:`TaskStoreUnavailable` and reads answer not-found. A missing file is a
+    fresh install. ``execution_epoch`` is the LOCAL recovery counter (1 at dispatch, +1 per resumed
+    execution) and is unrelated to any remote integration's generation counter."""
+
+    STORE_VERSION = 1
     _MAX_TERMINAL = 500
+    _DEFAULTS: dict[str, Any] = {
+        "reply": "", "push_url": "", "push_config_id": "", "request_metadata": {}, "message_id": "",
+        "session_key": "", "execution_epoch": 1, "execution_started_at": None, "cancel_requested_at": None,
+    }
 
-    def __init__(self) -> None:
+    def __init__(self, path: "str | os.PathLike[str] | None" = None) -> None:
         self._tasks: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self._watchers: dict[str, list[Future]] = {}
         self._lock = threading.Lock()
+        self._path = Path(path) if path else None
+        self.unavailable = ""
+        if self._path is not None:
+            self._load()
+
+    # ---- persistence -------------------------------------------------------------------------
+
+    def _load(self) -> None:
+        try:
+            raw = self._path.read_text(encoding="utf-8-sig")
+        except FileNotFoundError:
+            return
+        except (OSError, UnicodeDecodeError) as e:
+            self.unavailable = f"cannot read task store {self._path}: {e}"
+            _log.error("A2A: %s — refusing new tasks until it is repaired", self.unavailable)
+            return
+        try:
+            data = json.loads(raw)
+            version, tasks = int(data["version"]), data["tasks"]
+            if not isinstance(tasks, list):
+                raise ValueError("'tasks' is not a list")
+        except (ValueError, KeyError, TypeError) as e:  # JSONDecodeError is a ValueError
+            self.unavailable = f"corrupt task store {self._path}: {e}"
+            _log.error("A2A: %s — refusing new tasks until it is repaired", self.unavailable)
+            return
+        if version > self.STORE_VERSION:
+            self.unavailable = (f"task store {self._path} is version {version} but this build supports "
+                                f"{self.STORE_VERSION}; upgrade Hermes or move the file aside")
+            _log.error("A2A: %s", self.unavailable)
+            return
+        for rec in tasks:
+            if isinstance(rec, dict) and rec.get("task_id"):
+                self._tasks[str(rec["task_id"])] = self._normalize(rec)
+
+    @classmethod
+    def _normalize(cls, rec: dict) -> dict:
+        """Fill fields a record written by an older build lacks (additive migration)."""
+        out = dict(rec)
+        for key, default in cls._DEFAULTS.items():
+            out.setdefault(key, copy.deepcopy(default))
+        out.setdefault("updated_at", out.get("completed_at") or out.get("created_at") or time.time())
+        return out
+
+    def _save_locked(self) -> None:
+        """Atomic whole-file rewrite. Caller holds the lock. A failed write is logged, never raised:
+        the in-memory state stays authoritative for this process."""
+        if self._path is None:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_name(self._path.name + ".tmp")
+            tmp.write_text(json.dumps({"version": self.STORE_VERSION, "tasks": list(self._tasks.values())},
+                                      ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self._path)
+        except (OSError, TypeError, ValueError):
+            _log.error("A2A: could not persist task store %s", self._path, exc_info=True)
+
+    def _touch_locked(self, rec: dict) -> None:
+        rec["updated_at"] = time.time()
+        self._save_locked()
+
+    # ---- scope helpers -----------------------------------------------------------------------
 
     @staticmethod
     def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "", peer: str = "") -> bool:
@@ -368,17 +472,62 @@ class TaskStore:
         return {"configId": rec.get("push_config_id") or "", "taskId": rec["task_id"],
                 "createdAt": rec.get("created_iso", ""), "pushNotificationConfig": {"url": rec.get("push_url") or ""}}
 
+    # ---- mutations ---------------------------------------------------------------------------
+
     def create(self, task_id: str, context_id: str, peer: str, agent_slug: str = "", tenant: str = "") -> dict:
+        if self.unavailable:
+            raise TaskStoreUnavailable(self.unavailable)
+        now = time.time()
         rec = {"task_id": task_id, "context_id": context_id, "peer": peer, "agent_slug": agent_slug or "", "tenant": tenant or "",
-               "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
+               "state": STATE_SUBMITTED, "created_at": now, "created_iso": now_iso(), "updated_at": now,
+               **copy.deepcopy(self._DEFAULTS)}
         with self._lock:
             self._tasks[task_id] = rec
+            self._save_locked()
         return dict(rec)
+
+    def set_dispatch(self, task_id: str, *, session_key: str, request_metadata: Optional[dict] = None, message_id: str = "") -> None:
+        """Record the gateway session the task runs in plus the peer's bounded metadata / messageId."""
+        with self._lock:
+            if rec := self._tasks.get(task_id):
+                rec.update(session_key=session_key, request_metadata=dict(request_metadata or {}), message_id=message_id)
+                self._touch_locked(rec)
 
     def set_state(self, task_id: str, state: str) -> None:
         with self._lock:
             if (rec := self._tasks.get(task_id)) and rec["state"] not in TERMINAL_STATES:
                 rec["state"] = state
+                self._touch_locked(rec)
+
+    def mark_execution_started(self, task_id: str) -> None:
+        """The gateway began (or resumed) model work for this task."""
+        with self._lock:
+            if (rec := self._tasks.get(task_id)) and rec["state"] not in TERMINAL_STATES:
+                rec["execution_started_at"] = time.time()
+                self._touch_locked(rec)
+
+    def begin_recovery(self, task_id: str) -> int:
+        """Bump the local execution epoch before a resumed execution; returns the new epoch (0 if
+        the task is not recoverable)."""
+        with self._lock:
+            rec = self._tasks.get(task_id)
+            if not rec or rec["state"] in TERMINAL_STATES:
+                return 0
+            rec["execution_epoch"] = int(rec.get("execution_epoch") or 1) + 1
+            rec["execution_started_at"] = None
+            self._touch_locked(rec)
+            return rec["execution_epoch"]
+
+    def request_cancel(self, task_id: str) -> Optional[dict]:
+        """Durably record a cancel request (idempotent); the record, or None when terminal/missing."""
+        with self._lock:
+            rec = self._tasks.get(task_id)
+            if not rec or rec["state"] in TERMINAL_STATES:
+                return None
+            if not rec.get("cancel_requested_at"):
+                rec["cancel_requested_at"] = time.time()
+                self._touch_locked(rec)
+            return dict(rec)
 
     def set_push_config(self, task_id: str, url: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
         """Attach a push notification config; returns the stored config or None."""
@@ -386,6 +535,7 @@ class TaskStore:
             if not (rec := self._scoped(task_id, agent_slug, tenant, peer)):
                 return None
             rec["push_url"], rec["push_config_id"] = url, "cfg-" + uuid.uuid4().hex[:12]
+            self._touch_locked(rec)
             return self._push_config_view(rec)
 
     def get_push_config(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
@@ -401,6 +551,7 @@ class TaskStore:
             rec = self._push_rec(task_id, config_id, agent_slug, tenant, peer)
             if rec:
                 rec["push_url"] = rec["push_config_id"] = ""
+                self._touch_locked(rec)
             return rec is not None
 
     def pop_push_url(self, task_id: str) -> str:
@@ -408,7 +559,26 @@ class TaskStore:
             rec = self._tasks.get(task_id)
             if rec:
                 url, rec["push_url"] = rec["push_url"], ""
+                self._touch_locked(rec)
             return url if rec else ""
+
+    def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
+        """Transition a task to a terminal state, storing the FULL reply. Idempotent."""
+        with self._lock:
+            rec = self._tasks.get(task_id)
+            if not rec or rec["state"] in TERMINAL_STATES:
+                return None
+            rec.update(state=state, reply=reply, completed_at=time.time())
+            watchers = self._watchers.pop(task_id, [])
+            self._trim_locked()
+            self._touch_locked(rec)
+            out = dict(rec)
+        for fut in watchers:
+            if not fut.done():
+                fut.set_result((state, reply))
+        return out
+
+    # ---- reads -------------------------------------------------------------------------------
 
     def get(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
         with self._lock:
@@ -419,20 +589,11 @@ class TaskStore:
         with self._lock:
             return next((rec["peer"] for rec in self._tasks.values() if rec["context_id"] == context_id), "")
 
-    def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
-        """Transition a task to a terminal state. Idempotent."""
+    def in_flight(self, session_key: str = "") -> list[dict]:
+        """Non-terminal records (optionally only those dispatched into ``session_key``), oldest first."""
         with self._lock:
-            rec = self._tasks.get(task_id)
-            if not rec or rec["state"] in TERMINAL_STATES:
-                return None
-            rec.update(state=state, reply=reply, completed_at=time.time())
-            watchers = self._watchers.pop(task_id, [])
-            self._trim_locked()
-            out = dict(rec)
-        for fut in watchers:
-            if not fut.done():
-                fut.set_result((state, reply))
-        return out
+            return [dict(r) for r in self._tasks.values()
+                    if (not session_key or r.get("session_key") == session_key) and r["state"] not in TERMINAL_STATES]
 
     def watch(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[Future]:
         with self._lock:
@@ -460,11 +621,13 @@ class TaskStore:
         return (page, next_offset, total) if with_total else (page, next_offset)
 
     def fail_orphans(self, timeout_seconds: float = 300, *, exclude: set[str] | None = None) -> list[str]:
+        """Fail non-terminal tasks idle (no ``updated_at`` touch) longer than ``timeout_seconds``,
+        except ``exclude`` (tasks a request owns or whose execution is alive)."""
         excluded = exclude or set()
         with self._lock:
             stale = [tid for tid, rec in self._tasks.items()
                      if tid not in excluded and rec["state"] not in TERMINAL_STATES
-                     and time.time() - rec["created_at"] > timeout_seconds]
+                     and time.time() - (rec.get("updated_at") or rec["created_at"]) > timeout_seconds]
         return [tid for tid in stale if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]")]
 
     def _trim_locked(self) -> None:
@@ -473,12 +636,21 @@ class TaskStore:
             self._tasks.pop(tid, None)
 
     @staticmethod
+    def lifecycle_view(rec: dict) -> dict:
+        """Read-only, secret-free record view handed to the ``a2a_task_lifecycle`` hook."""
+        return {k: copy.deepcopy(rec.get(k)) for k in (
+            "task_id", "context_id", "peer", "agent_slug", "tenant", "state", "execution_epoch",
+            "execution_started_at", "cancel_requested_at", "request_metadata", "session_key", "message_id")}
+
+    @staticmethod
     def to_task(rec: dict, include_artifacts: bool = True) -> dict:
-        """Render a stored record as an A2A v1.0 Task."""
+        """Render a stored record as an A2A v1.0 Task (full reply, never a preview)."""
         task = build_task(rec["task_id"], rec["context_id"], rec["state"], rec.get("reply", ""),
                           created_at=rec.get("created_iso", ""))
         if not include_artifacts:
             task.pop("artifacts", None)
+        if rec.get("cancel_requested_at") and rec["state"] not in TERMINAL_STATES:
+            task["metadata"] = {"cancelRequested": True}  # requested, not yet a confirmed stop
         return task
 
 

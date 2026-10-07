@@ -605,14 +605,21 @@ class TestRegistryDispatchConvention:
 def _bare_adapter():
     from plugins.platforms.a2a.adapter import A2AAdapter
     from gateway.config import PlatformConfig
-    return A2AAdapter(PlatformConfig(enabled=True))
+    return A2AAdapter(PlatformConfig(enabled=True, extra={"task_store": ":memory:"}))
+
+
+def _dispatched(adapter, task_id, context_id):
+    """A dispatched (WORKING) task and the store future an HTTP waiter observes."""
+    adapter.tasks.create(task_id, context_id, "peer")
+    adapter.tasks.set_state(task_id, protocol.STATE_WORKING)
+    return adapter.tasks.watch(task_id)
 
 
 class TestReplyCapture:
     def test_send_waits_for_notify_marked_final_reply(self):
         """Interim/editable sends must not satisfy the blocked A2A RPC future."""
         adapter = _bare_adapter()
-        fut = adapter._add_pending("task-final", "ctx-final")
+        fut = _dispatched(adapter, "task-final", "ctx-final")
 
         async def run():
             interim = await adapter.send(
@@ -633,17 +640,14 @@ class TestReplyCapture:
             assert final.success is True
             assert fut.result(timeout=0) == (protocol.STATE_COMPLETED, "FINAL_PROOF_PAYLOAD")
 
-        try:
-            asyncio.run(run())
-        finally:
-            adapter._pop_pending("task-final")
+        asyncio.run(run())
 
     def test_concurrent_same_context_tasks_resolve_exactly(self):
         """Two in-flight tasks sharing a context must not cross-talk: each final send settles
         exactly the task it names, whatever the arrival order."""
         adapter = _bare_adapter()
-        fut1 = adapter._add_pending("task-1", "ctx-shared")
-        fut2 = adapter._add_pending("task-2", "ctx-shared")
+        fut1 = _dispatched(adapter, "task-1", "ctx-shared")
+        fut2 = _dispatched(adapter, "task-2", "ctx-shared")
 
         async def run():
             await adapter.send("ctx-shared", "reply two", reply_to="task-2", metadata={"notify": True})
@@ -652,46 +656,37 @@ class TestReplyCapture:
             await adapter.send("ctx-shared", "reply one", metadata={"notify": True, "reply_to_message_id": "task-1"})
             assert fut1.result(timeout=0)[1] == "reply one"
 
-        try:
-            asyncio.run(run())
-        finally:
-            adapter._pop_pending("task-1")
-            adapter._pop_pending("task-2")
+        asyncio.run(run())
 
     def test_on_processing_complete_resolves_failure(self):
         """A failed run must resolve the future promptly (no reply timeout wait)."""
         from gateway.platforms.event import ProcessingOutcome
 
         adapter = _bare_adapter()
-        fut = adapter._add_pending("task-fail", "ctx-fail")
+        fut = _dispatched(adapter, "task-fail", "ctx-fail")
         event = SimpleNamespace(message_id="task-fail")
 
         async def run():
             await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
 
-        try:
-            asyncio.run(run())
-            state, text = fut.result(timeout=0)
-            assert state == protocol.STATE_FAILED
-        finally:
-            adapter._pop_pending("task-fail")
+        asyncio.run(run())
+        state, text = fut.result(timeout=0)
+        assert state == protocol.STATE_FAILED
 
     def test_on_processing_complete_does_not_clobber_reply(self):
         from gateway.platforms.event import ProcessingOutcome
 
         adapter = _bare_adapter()
-        fut = adapter._add_pending("task-ok", "ctx-ok")
+        fut = _dispatched(adapter, "task-ok", "ctx-ok")
         event = SimpleNamespace(message_id="task-ok")
 
         async def run():
             await adapter.send("ctx-ok", "real reply", reply_to="task-ok", metadata={"notify": True})
             await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
-        try:
-            asyncio.run(run())
-            assert fut.result(timeout=0) == (protocol.STATE_COMPLETED, "real reply")
-        finally:
-            adapter._pop_pending("task-ok")
+        asyncio.run(run())
+        assert fut.result(timeout=0) == (protocol.STATE_COMPLETED, "real reply")
+        assert adapter.tasks.get("task-ok")["reply"] == "real reply"
 
     def test_on_processing_complete_recovers_streamed_reply(self):
         """#116944: when the gateway's normal final send is suppressed because streaming
@@ -701,17 +696,15 @@ class TestReplyCapture:
         from gateway.platforms.event import ProcessingOutcome
 
         adapter = _bare_adapter()
-        fut = adapter._add_pending("task-streamed", "ctx-streamed")
+        fut = _dispatched(adapter, "task-streamed", "ctx-streamed")
         event = SimpleNamespace(message_id="task-streamed", _streamed_final_response="SSE_OK")
 
         async def run():
             await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
-        try:
-            asyncio.run(run())
-            assert fut.result(timeout=0) == (protocol.STATE_COMPLETED, "SSE_OK")
-        finally:
-            adapter._pop_pending("task-streamed")
+        asyncio.run(run())
+        assert fut.result(timeout=0) == (protocol.STATE_COMPLETED, "SSE_OK")
+        assert adapter.tasks.get("task-streamed")["reply"] == "SSE_OK"
 
 
 # --------------------------------------------------------------------------
