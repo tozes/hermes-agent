@@ -1880,6 +1880,17 @@ DEFAULT_CONFIG = {
         # root profile named "default", so on a shared kanban.db every home can otherwise claim
         # default-assigned cards.
         "dispatch_profiles": None,
+        # Per-home board allowlist for the gateway-embedded dispatcher: board slugs this home's
+        # dispatcher may poll, ready-probe, auto-decompose, and tick (list or comma-separated
+        # string). None (key absent) = all live boards (legacy behavior). Set = fail-closed: an
+        # empty/invalid value, unknown or archived board, unreadable config, or enumeration error
+        # dispatches zero boards and never falls back to default or all boards.
+        "dispatch_boards": None,
+        # Explicit secondary profiles whose plugin managers observe on_kanban_dispatch_tick in
+        # their own home and secret scope after each embedded dispatcher tick (list or
+        # comma-separated string). None (key absent) = only the dispatcher's own profile fires
+        # hooks (legacy behavior). Set = fail-closed (never broadcasts to all profiles).
+        "dispatch_tick_observer_profiles": None,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,

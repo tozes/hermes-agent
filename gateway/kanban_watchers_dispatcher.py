@@ -14,7 +14,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
+from gateway.kanban_watchers_common import (
+    _board_slugs,
+    _dispatch_board_allowlist,
+    _dispatch_tick_observer_profiles,
+    _positive_int_setting,
+    logger,
+)
 
 
 def _kbc():
@@ -172,17 +178,66 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards.pop(slug, None)
         return True
 
-    def tick_once_for_board(self, slug: str) -> Optional[object]:
-        """Run one dispatch_once for a specific board.
+    def _fire_observer_profile_hooks(self, slug: str, result: object) -> None:
+        """Invoke ``on_kanban_dispatch_tick`` in each explicitly configured observer profile's
+        own home and credential scope through the native ``PluginManager`` lifecycle.
 
-        The per-board DB is opened explicitly so boards never share a
-        connection or claim across each other.
+        Unconfigured (key absent) is a no-op. Invalid config or any unknown profile fails
+        closed without broadcasting to sibling profiles.
         """
+        profiles = _dispatch_tick_observer_profiles()
+        if not profiles:
+            return
+        try:
+            from agent.runtime_scope import bind_profile_scope
+            from hermes_cli import kanban_db as _kb
+            from hermes_cli.profiles import get_profile_dir, profile_exists
+            from hermes_constants import get_hermes_home, hermes_home_key
+        except Exception as exc:
+            logger.warning(
+                "kanban dispatcher: observer profile runtime unavailable (%s: %s) — failing closed",
+                type(exc).__name__, exc,
+            )
+            return
+
+        current_key = hermes_home_key(get_hermes_home())
+        targets: list[tuple[str, Path]] = []
+        missing: list[str] = []
+        for name in profiles:
+            if not profile_exists(name):
+                missing.append(name)
+                continue
+            profile_home = get_profile_dir(name)
+            if hermes_home_key(profile_home) == current_key:
+                # Already fired in the dispatcher's own scope inside dispatch_once.
+                continue
+            targets.append((name, profile_home))
+        if missing:
+            logger.warning(
+                "kanban dispatcher: kanban.dispatch_tick_observer_profiles names unknown profile(s) %r "
+                "— failing closed (no observer hooks fired)",
+                missing,
+            )
+            return
+
+        for name, profile_home in targets:
+            try:
+                with bind_profile_scope(profile_home):
+                    _kb._fire_dispatch_tick_hook(result, board=slug, dry_run=False)
+            except Exception:
+                logger.warning(
+                    "kanban dispatcher: observer hook failed for profile %r on board %r",
+                    name, slug, exc_info=True,
+                )
+
+    def _tick_validated_board(self, slug: str) -> Optional[object]:
+        """Run one dispatch_once for an already-allowlisted board, then fire scoped observer hooks."""
         conn = None
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
             return None
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        result: Optional[object] = None
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
@@ -192,7 +247,7 @@ class _KanbanDispatcher:
             from hermes_cli import kanban_db as _kb
             with _kb.pin_first_board_resolution():
                 conn = _kbc().connect(board=slug)
-                return _kbd().dispatch_once(conn, board=slug, **kwargs)
+                result = _kbd().dispatch_once(conn, board=slug, **kwargs)
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
@@ -211,10 +266,31 @@ class _KanbanDispatcher:
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.close()
+        if result is not None:
+            self._fire_observer_profile_hooks(slug, result)
+        return result
+
+    def tick_once_for_board(self, slug: str) -> Optional[object]:
+        """Run one dispatch_once for a specific board, respecting ``kanban.dispatch_boards``.
+
+        The per-board DB is opened explicitly so boards never share a
+        connection or claim across each other.
+        """
+        allowlist = _dispatch_board_allowlist(self.kb)
+        if allowlist is not None:
+            normalize_slug = getattr(self.kb, "_normalize_board_slug", None)
+            try:
+                normed = normalize_slug(slug) if callable(normalize_slug) else str(slug).strip().lower()
+            except Exception:
+                return None
+            if not normed or normed not in self._board_slugs():
+                return None
+            slug = normed
+        return self._tick_validated_board(slug)
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
-        """Run one dispatch_once per board. Returns (slug, result) pairs."""
-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+        """Run one dispatch_once per eligible board. Returns (slug, result) pairs."""
+        return [(slug, self._tick_validated_board(slug)) for slug in self._board_slugs()]
 
     def ready_nonempty(self) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?

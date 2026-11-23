@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Mapping
 from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -42,8 +43,199 @@ def _list_boards(kb: Any) -> list:
         return [kb.read_board_metadata(kb.DEFAULT_BOARD)]
 
 
+def _read_user_kanban_section(setting_name: str) -> tuple[bool, Optional[Mapping[str, Any]]]:
+    """Read the raw user ``kanban`` mapping without ``DEFAULT_CONFIG`` merge.
+
+    Returns ``(True, mapping_or_none)`` on success, or ``(False, None)`` when
+    config cannot be read or has a non-mapping root / ``kanban`` section so
+    presence-sensitive allowlists fail closed.
+    """
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+
+        cfg = load_user_config_effective(fail_closed=True)
+        if cfg is None:
+            return True, None
+        if not isinstance(cfg, Mapping):
+            raise TypeError(f"config root is {type(cfg).__name__}, not a mapping")
+        kanban = cfg.get("kanban")
+        if kanban is not None and not isinstance(kanban, Mapping):
+            raise TypeError(f"the `kanban` section is {type(kanban).__name__}, not a mapping")
+        return True, kanban
+    except Exception as exc:
+        logger.warning(
+            "kanban dispatcher: kanban.%s cannot be resolved (%s: %s) — failing closed",
+            setting_name, type(exc).__name__, exc,
+        )
+        return False, None
+
+
+def _parse_allowlist_entries(
+    raw: Any,
+    setting_name: str,
+    normalize_fn: Callable[[str], Optional[str]],
+) -> tuple[str, ...]:
+    """Validate a configured list or comma-separated allowlist; fail closed to ``()`` on any error."""
+    if raw is None or isinstance(raw, bool):
+        logger.warning(
+            "kanban dispatcher: kanban.%s is present but empty/invalid (%r) — failing closed; "
+            "omit the key for legacy behavior",
+            setting_name, raw,
+        )
+        return ()
+    if isinstance(raw, str):
+        if not raw.strip():
+            logger.warning(
+                "kanban dispatcher: kanban.%s is present but empty — failing closed; "
+                "omit the key for legacy behavior",
+                setting_name,
+            )
+            return ()
+        parts = [part.strip() for part in raw.split(",")]
+    elif isinstance(raw, (list, tuple)):
+        if not raw:
+            logger.warning(
+                "kanban dispatcher: kanban.%s is empty — failing closed; "
+                "omit the key for legacy behavior",
+                setting_name,
+            )
+            return ()
+        parts = []
+        for item in raw:
+            if not isinstance(item, str) or not item.strip():
+                logger.warning(
+                    "kanban dispatcher: kanban.%s contains non-string or empty entry %r — failing closed",
+                    setting_name, item,
+                )
+                return ()
+            parts.append(item.strip())
+    else:
+        logger.warning(
+            "kanban dispatcher: kanban.%s must be a list or comma-separated string, got %s — failing closed",
+            setting_name, type(raw).__name__,
+        )
+        return ()
+
+    normalized: list[str] = []
+    for part in parts:
+        if not part:
+            logger.warning(
+                "kanban dispatcher: kanban.%s contains an empty entry — failing closed",
+                setting_name,
+            )
+            return ()
+        try:
+            normed = normalize_fn(part)
+        except Exception as exc:
+            logger.warning(
+                "kanban dispatcher: kanban.%s contains invalid entry %r (%s) — failing closed",
+                setting_name, part, exc,
+            )
+            return ()
+        if not normed:
+            logger.warning(
+                "kanban dispatcher: kanban.%s contains invalid entry %r — failing closed",
+                setting_name, part,
+            )
+            return ()
+        normalized.append(normed)
+    return tuple(dict.fromkeys(normalized))
+
+
+def _dispatch_board_allowlist(kb: Any) -> Optional[tuple[str, ...]]:
+    """Configured ``kanban.dispatch_boards`` allowlist, re-read live from user config.
+
+    Returns ``None`` only when the key is absent from a readable user config
+    (legacy semantics: all live boards). Returns a normalized tuple when valid,
+    or ``()`` to fail closed on unreadable/invalid/empty config.
+    """
+    ok, kanban = _read_user_kanban_section("dispatch_boards")
+    if not ok:
+        return ()
+    if "dispatch_boards" not in (kanban or {}):
+        return None
+    normalize_slug = getattr(kb, "_normalize_board_slug", None)
+    if not callable(normalize_slug):
+        logger.warning("kanban dispatcher: kanban_db._normalize_board_slug unavailable — failing closed")
+        return ()
+    return _parse_allowlist_entries(kanban["dispatch_boards"], "dispatch_boards", normalize_slug)
+
+
+def _dispatch_tick_observer_profiles() -> Optional[tuple[str, ...]]:
+    """Configured ``kanban.dispatch_tick_observer_profiles``, re-read live from user config.
+
+    Returns ``None`` when absent (legacy semantics: only the dispatcher's own
+    profile fires ``on_kanban_dispatch_tick``). Returns a normalized tuple when
+    valid, or ``()`` to fail closed on unreadable/invalid/empty config.
+    """
+    ok, kanban = _read_user_kanban_section("dispatch_tick_observer_profiles")
+    if not ok:
+        return ()
+    if "dispatch_tick_observer_profiles" not in (kanban or {}):
+        return None
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+    except Exception as exc:
+        logger.warning(
+            "kanban dispatcher: hermes_cli.profiles unavailable for kanban.dispatch_tick_observer_profiles "
+            "(%s: %s) — failing closed",
+            type(exc).__name__, exc,
+        )
+        return ()
+    return _parse_allowlist_entries(
+        kanban["dispatch_tick_observer_profiles"],
+        "dispatch_tick_observer_profiles",
+        normalize_profile_name,
+    )
+
+
 def _board_slugs(kb: Any) -> list:
-    return [b.get("slug") or kb.DEFAULT_BOARD for b in _list_boards(kb)]
+    """Live board slugs eligible for the embedded dispatcher this tick.
+
+    Unconfigured (``kanban.dispatch_boards`` absent): legacy behavior — every
+    live board, with ``_list_boards`` falling back to ``default`` on error.
+
+    Configured (or config unreadable): fail closed — never falls back to
+    ``default`` or all boards on invalid config, unknown/archived boards, or
+    enumeration failure.
+    """
+    allowlist = _dispatch_board_allowlist(kb)
+    if allowlist is None:
+        return [b.get("slug") or kb.DEFAULT_BOARD for b in _list_boards(kb)]
+    if not allowlist:
+        return []
+    try:
+        live_boards = kb.list_boards(include_archived=False)
+    except Exception as exc:
+        logger.warning(
+            "kanban dispatcher: board enumeration failed with kanban.dispatch_boards configured "
+            "(%s: %s) — failing closed (0 boards)",
+            type(exc).__name__, exc,
+        )
+        return []
+    normalize_slug = getattr(kb, "_normalize_board_slug", None)
+    live_slugs: set[str] = set()
+    for entry in live_boards or ():
+        if not isinstance(entry, Mapping):
+            continue
+        raw_slug = entry.get("slug")
+        if not isinstance(raw_slug, str) or not raw_slug.strip():
+            continue
+        try:
+            normed = normalize_slug(raw_slug) if callable(normalize_slug) else raw_slug.strip().lower()
+        except Exception:
+            continue
+        if normed:
+            live_slugs.add(normed)
+    unknown = [slug for slug in allowlist if slug not in live_slugs]
+    if unknown:
+        logger.warning(
+            "kanban dispatcher: kanban.dispatch_boards names unknown or archived board(s) %r "
+            "(live: %s) — failing closed (0 boards)",
+            unknown, sorted(live_slugs),
+        )
+        return []
+    return list(allowlist)
 
 
 def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:
